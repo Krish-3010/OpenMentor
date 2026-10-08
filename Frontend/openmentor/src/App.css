@@ -322,6 +322,7 @@
   background: var(--surface);
   box-shadow: var(--shadow);
   backdrop-filter: blur(18px);
+  margin-top: 25px;
 }
 
 .landing-copy {
