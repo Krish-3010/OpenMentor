@@ -27,7 +27,14 @@ function App() {
   const [isMenuOpen, setIsMenuOpen] = useState(false)
   const [scrollY, setScrollY] = useState(0)
   const [authMode, setAuthMode] = useState('register')
-  const [currentUser, setCurrentUser] = useState(null)
+  const [currentUser, setCurrentUser] = useState(() => {
+    try {
+      const saved = localStorage.getItem('openmentor_user')
+      return saved ? JSON.parse(saved) : null
+    } catch {
+      return null
+    }
+  })
   const [mentors, setMentors] = useState([])
   const [requests, setRequests] = useState([])
   const [activeSkill, setActiveSkill] = useState('All')
@@ -43,23 +50,44 @@ function App() {
   const [notice, setNotice] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isAvailabilityUpdating, setIsAvailabilityUpdating] = useState(false)
+  const [isProfileUpdating, setIsProfileUpdating] = useState(false)
+
+  useEffect(() => {
+    if (currentUser) {
+      try {
+        localStorage.setItem('openmentor_user', JSON.stringify(currentUser))
+      } catch {
+        // localStorage quota / security limit fallback
+      }
+    } else {
+      localStorage.removeItem('openmentor_user')
+    }
+  }, [currentUser])
+
+  const refreshMentors = async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/mentors/`)
+      if (!response.ok) return
+      const mentorData = await readResponse(response)
+      setMentors(mentorData.mentors || [])
+    } catch {
+      // silent fallback
+    }
+  }
 
   useEffect(() => {
     const controller = new AbortController()
 
     async function loadData() {
       try {
-        const [mentorResponse] = await Promise.all([
-          fetch(`${API_BASE_URL}/mentors/`, { signal: controller.signal }),
-        ])
-
-        if (!mentorResponse.ok) {
+        const response = await fetch(`${API_BASE_URL}/mentors/`, { signal: controller.signal })
+        if (!response.ok) {
           throw new Error('API unavailable')
         }
-
-        const mentorData = await readResponse(mentorResponse)
-        setMentors(mentorData.mentors)
-        setSelectedMentor(mentorData.mentors[0] || null)
+        const mentorData = await readResponse(response)
+        const fetched = mentorData.mentors || []
+        setMentors(fetched)
+        setSelectedMentor((prev) => prev || fetched[0] || null)
       } catch (error) {
         if (error.name !== 'AbortError') {
           setNotice('Unable to load mentors. Please try again when the service is available.')
@@ -92,21 +120,22 @@ function App() {
   }, [])
 
   const skills = useMemo(() => {
-    const allSkills = mentors.flatMap((mentor) => mentor.skills)
+    const allSkills = mentors.flatMap((mentor) => mentor.skills || [])
     return ['All', ...Array.from(new Set(allSkills))]
   }, [mentors])
 
   const filteredMentors = useMemo(() => {
     return mentors.filter((mentor) => {
-      const matchesSkill = activeSkill === 'All' || mentor.skills.includes(activeSkill)
-      const searchText = `${mentor.name} ${mentor.role} ${mentor.skills.join(' ')} ${mentor.bio}`.toLowerCase()
+      const mentorSkills = mentor.skills || []
+      const matchesSkill = activeSkill === 'All' || mentorSkills.includes(activeSkill)
+      const searchText = `${mentor.name || ''} ${mentor.role || ''} ${mentorSkills.join(' ')} ${mentor.bio || ''}`.toLowerCase()
       return matchesSkill && searchText.includes(query.toLowerCase())
     })
   }, [activeSkill, mentors, query])
 
   const stats = [
     { label: 'Available mentors', value: mentors.length },
-    { label: 'Sessions hosted', value: mentors.reduce((total, mentor) => total + mentor.sessions, 0) },
+    { label: 'Sessions hosted', value: mentors.reduce((total, mentor) => total + (mentor.sessions || 0), 0) },
     { label: 'Open requests', value: requests.filter((request) => request.status === 'Requested').length },
   ]
 
@@ -120,7 +149,6 @@ function App() {
       setPage(currentUser.role === 'senior' ? 'requests' : 'mentors')
       return
     }
-
     goToAuth('register')
   }
 
@@ -137,9 +165,9 @@ function App() {
         const data = await readResponse(response)
         if (!response.ok) throw new Error(data.error || 'Authentication failed')
         setCurrentUser(data.user)
-        setRequestForm((current) => ({ ...current, juniorName: data.user.name, email: data.user.email }))
         setNotice(`${authMode === 'login' ? 'Logged in' : 'Registered'} as ${data.user.name}.`)
         setPage(data.user.role === 'senior' ? 'requests' : 'mentors')
+        refreshMentors()
       })
       .catch((error) => setNotice(error.message))
   }
@@ -173,14 +201,19 @@ function App() {
       return
     }
 
+    if (!selectedMentor) {
+      setNotice('Please select a mentor to send a request.')
+      return
+    }
+
     setIsSubmitting(true)
     setNotice('')
 
     const payload = {
       ...requestForm,
       juniorId: currentUser.id,
-      mentorId: selectedMentor?.id,
-      mentorName: selectedMentor?.name,
+      mentorId: selectedMentor.id,
+      mentorName: selectedMentor.name,
     }
 
     try {
@@ -206,20 +239,25 @@ function App() {
       })
       setIsSubmitting(false)
     }
-
   }
 
   async function updateRequest(requestId, status) {
-    const response = await fetch(`${API_BASE_URL}/requests/${requestId}/`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status, seniorId: currentUser.id }),
-    })
-    if (!response.ok) {
+    try {
+      const response = await fetch(`${API_BASE_URL}/requests/${requestId}/`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status, seniorId: currentUser.id }),
+      })
       const data = await readResponse(response)
-      throw new Error(data.error || 'Could not update request')
+      if (!response.ok) {
+        throw new Error(data.error || 'Could not update request')
+      }
+      setRequests((current) => current.map((item) => item.id === requestId ? { ...item, status } : item))
+      setNotice(`Request status updated to ${status}.`)
+      refreshMentors()
+    } catch (error) {
+      setNotice(error.message)
     }
-    setRequests((current) => current.map((item) => item.id === requestId ? { ...item, status } : item))
   }
 
   async function toggleAvailability() {
@@ -235,10 +273,31 @@ function App() {
       if (!response.ok) throw new Error(data.error || 'Could not update availability')
       setCurrentUser((current) => ({ ...current, available: data.available }))
       setNotice(`You are now ${available ? 'available' : 'unavailable'} for mentorship.`)
+      refreshMentors()
     } catch (error) {
       setNotice(error.message)
     } finally {
       setIsAvailabilityUpdating(false)
+    }
+  }
+
+  async function handleProfileUpdate(profilePayload) {
+    setIsProfileUpdating(true)
+    try {
+      const response = await fetch(`${API_BASE_URL}/users/${currentUser.id}/profile/`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(profilePayload),
+      })
+      const data = await readResponse(response)
+      if (!response.ok) throw new Error(data.error || 'Could not update profile')
+      setCurrentUser(data.user)
+      setNotice('Profile updated successfully.')
+      refreshMentors()
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setIsProfileUpdating(false)
     }
   }
 
@@ -247,7 +306,7 @@ function App() {
       <header className={`topbar ${scrollY > 24 ? 'topbar-scrolled' : ''}`} aria-label="OpenMentor navigation">
         <button className="brand" type="button" onClick={() => setPage('home')} aria-label="OpenMentor home">
           <span className="brand-mark">
-            <img src="/logo.png" alt="" />
+            <img src="/logo.png" alt="OpenMentor logo" />
           </span>
           <span>OpenMentor</span>
         </button>
@@ -321,8 +380,10 @@ function App() {
             currentUser={currentUser}
             form={requestForm}
             isSubmitting={isSubmitting}
+            mentors={mentors}
             selectedMentor={selectedMentor}
             requests={requests}
+            onSelectMentor={setSelectedMentor}
             onUpdateRequest={updateRequest}
             onAuth={() => goToAuth('register')}
             onFormChange={setRequestForm}
@@ -347,6 +408,8 @@ function App() {
             onMentors={() => setPage('mentors')}
             onToggleAvailability={toggleAvailability}
             isAvailabilityUpdating={isAvailabilityUpdating}
+            onUpdateProfile={handleProfileUpdate}
+            isProfileUpdating={isProfileUpdating}
           />
         )}
       </div>
@@ -420,7 +483,7 @@ function LandingPage({ currentUser, stats, onExplore, onGetStarted }) {
           <div className="story-visual-inner" style={{
             transform: `translate3d(${storyProgress * 10}px, ${storyProgress * -18}px, 0) rotate(${storyProgress * 7 - 3}deg) scale(${1 + storyProgress * 0.08})`,
           }}>
-            <img src="/logo.png" alt="" />
+            <img src="/logo.png" alt="OpenMentor logo" />
             <div className="story-ring" />
             <span className="story-number">0{activeStory + 1}</span>
           </div>
@@ -511,22 +574,22 @@ function MentorsPage({
                 <p>{mentor.role}</p>
               </div>
             </div>
-            <p className="mentor-bio">{mentor.bio}</p>
+            <p className="mentor-bio">{mentor.bio || 'Senior mentor ready to guide students.'}</p>
             <div className="tags">
-              {mentor.skills.map((skill) => <span key={skill}>{skill}</span>)}
+              {(mentor.skills || []).map((skill) => <span key={skill}>{skill}</span>)}
             </div>
             <dl className="mentor-meta">
               <div>
                 <dt>Rating</dt>
-                <dd>{mentor.rating}</dd>
+                <dd>{mentor.rating ?? 5.0}</dd>
               </div>
               <div>
                 <dt>Mode</dt>
-                <dd>{mentor.mode}</dd>
+                <dd>{mentor.mode || 'Online'}</dd>
               </div>
               <div>
                 <dt>Next slot</dt>
-                <dd>{mentor.availability}</dd>
+                <dd>{mentor.availability || 'Available'}</dd>
               </div>
             </dl>
             <button type="button" onClick={() => onRequest(mentor)}>
@@ -543,8 +606,10 @@ function RequestsPage({
   currentUser,
   form,
   isSubmitting,
+  mentors,
   selectedMentor,
   requests,
+  onSelectMentor,
   onUpdateRequest,
   onAuth,
   onFormChange,
@@ -584,9 +649,27 @@ function RequestsPage({
           <h2>{selectedMentor?.name || 'Select a mentor'}</h2>
           <p>
             {selectedMentor
-              ? `${selectedMentor.name} is available ${selectedMentor.availability.toLowerCase()} for ${selectedMentor.mode.toLowerCase()} mentorship.`
-              : 'Pick a mentor from the mentors page to begin.'}
+              ? `${selectedMentor.name} is available ${selectedMentor.availability ? selectedMentor.availability.toLowerCase() : 'for mentorship'} (${(selectedMentor.mode || 'Online').toLowerCase()}).`
+              : 'Pick a mentor below to request guidance.'}
           </p>
+
+          <label className="search-box" style={{ marginTop: '20px' }}>
+            <span>Change Mentor</span>
+            <select
+              value={selectedMentor?.id || ''}
+              onChange={(e) => {
+                const found = mentors.find((m) => m.id === e.target.value)
+                if (found) onSelectMentor(found)
+              }}
+            >
+              <option value="" disabled>-- Select a Mentor --</option>
+              {mentors.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name} ({m.mode || 'Online'})
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
 
         <form className="request-form" onSubmit={onSubmit}>
@@ -596,7 +679,7 @@ function RequestsPage({
               required
               value={form.juniorName}
               onChange={(event) => onFormChange({ ...form, juniorName: event.target.value })}
-              placeholder="Junior name"
+              placeholder="Your full name"
             />
           </label>
           <label>
@@ -615,7 +698,7 @@ function RequestsPage({
               required
               value={form.goal}
               onChange={(event) => onFormChange({ ...form, goal: event.target.value })}
-              placeholder="Tell the senior what you need help with."
+              placeholder="Tell the senior what topics or projects you need help with."
               rows="4"
             />
           </label>
@@ -625,7 +708,7 @@ function RequestsPage({
               required
               value={form.preferredTime}
               onChange={(event) => onFormChange({ ...form, preferredTime: event.target.value })}
-              placeholder="Today after 6 PM"
+              placeholder="e.g. Weekdays after 5 PM"
             />
           </label>
           <button type="submit" disabled={isSubmitting || !selectedMentor}>
@@ -677,7 +760,7 @@ function AuthPage({ authForm, authMode, onAuthModeChange, onFormChange, onSubmit
               required
               value={authForm.name}
               onChange={(event) => onFormChange({ ...authForm, name: event.target.value })}
-              placeholder="Krish Mojidra"
+              placeholder="Alex Johnson"
             />
           </label>
         )}
@@ -709,8 +792,8 @@ function AuthPage({ authForm, authMode, onAuthModeChange, onFormChange, onSubmit
               value={authForm.role}
               onChange={(event) => onFormChange({ ...authForm, role: event.target.value })}
             >
-              <option>Junior</option>
-              <option>Senior mentor</option>
+              <option value="Junior">Junior</option>
+              <option value="Senior mentor">Senior mentor</option>
             </select>
           </label>
         )}
@@ -720,24 +803,47 @@ function AuthPage({ authForm, authMode, onAuthModeChange, onFormChange, onSubmit
   )
 }
 
-function ProfilePage({ currentUser, onLogout, onMentors, onToggleAvailability, isAvailabilityUpdating }) {
+function ProfilePage({
+  currentUser,
+  onLogout,
+  onMentors,
+  onToggleAvailability,
+  isAvailabilityUpdating,
+  onUpdateProfile,
+  isProfileUpdating,
+}) {
+  const [profileData, setProfileData] = useState({
+    name: currentUser?.name || '',
+    bio: currentUser?.bio || '',
+    skills: Array.isArray(currentUser?.skills) ? currentUser.skills.join(', ') : currentUser?.skills || '',
+    mode: currentUser?.mode || 'Online',
+    availability: currentUser?.availability || 'Available for mentorship',
+  })
+
   if (!currentUser) {
     return null
+  }
+
+  const isSenior = currentUser.role === 'senior'
+
+  const handleSubmit = (e) => {
+    e.preventDefault()
+    onUpdateProfile(profileData)
   }
 
   return (
     <section className="profile-layout">
       <div className="profile-card">
-        <div className="avatar large" aria-hidden="true">{currentUser.name.slice(0, 2).toUpperCase()}</div>
+        <div className="avatar large" aria-hidden="true">{(currentUser.name || 'OM').slice(0, 2).toUpperCase()}</div>
         <div>
           <p className="eyebrow">Profile</p>
           <h2>{currentUser.name}</h2>
           <p>{currentUser.email}</p>
-          <p>{currentUser.role}</p>
+          <p style={{ textTransform: 'capitalize' }}>{currentUser.role} Account</p>
         </div>
         <div className="profile-actions">
-          {currentUser.role !== 'senior' && <button className="secondary-action" type="button" onClick={onMentors}>Browse mentors</button>}
-          {currentUser.role === 'senior' && (
+          {!isSenior && <button className="secondary-action" type="button" onClick={onMentors}>Browse mentors</button>}
+          {isSenior && (
             <button className="secondary-action" type="button" onClick={onToggleAvailability} disabled={isAvailabilityUpdating}>
               {currentUser.available ? 'Turn availability off' : 'Turn availability on'}
             </button>
@@ -746,6 +852,65 @@ function ProfilePage({ currentUser, onLogout, onMentors, onToggleAvailability, i
             Logout
           </button>
         </div>
+      </div>
+
+      <div className="landing-copy" style={{ minHeight: 'auto', padding: '28px' }}>
+        <p className="eyebrow">Edit Profile Details</p>
+        <h2>Update Information</h2>
+        <form className="request-form" onSubmit={handleSubmit} style={{ marginTop: '16px' }}>
+          <label>
+            Full Name
+            <input
+              required
+              value={profileData.name}
+              onChange={(e) => setProfileData({ ...profileData, name: e.target.value })}
+            />
+          </label>
+          <label>
+            Bio
+            <input
+              value={profileData.bio}
+              onChange={(e) => setProfileData({ ...profileData, bio: e.target.value })}
+              placeholder="Brief introduction or background..."
+            />
+          </label>
+
+          {isSenior && (
+            <>
+              <label>
+                Skills (comma-separated)
+                <input
+                  value={profileData.skills}
+                  onChange={(e) => setProfileData({ ...profileData, skills: e.target.value })}
+                  placeholder="Python, Data Structures, Web Development"
+                />
+              </label>
+              <label>
+                Mentorship Mode
+                <select
+                  value={profileData.mode}
+                  onChange={(e) => setProfileData({ ...profileData, mode: e.target.value })}
+                >
+                  <option value="Online">Online</option>
+                  <option value="In-Person">In-Person</option>
+                  <option value="Hybrid">Hybrid</option>
+                </select>
+              </label>
+              <label style={{ gridColumn: '1 / -1' }}>
+                Availability Note / Slot
+                <input
+                  value={profileData.availability}
+                  onChange={(e) => setProfileData({ ...profileData, availability: e.target.value })}
+                  placeholder="e.g. Weekdays 4 PM - 6 PM"
+                />
+              </label>
+            </>
+          )}
+
+          <button type="submit" disabled={isProfileUpdating}>
+            {isProfileUpdating ? 'Saving...' : 'Save Profile Changes'}
+          </button>
+        </form>
       </div>
     </section>
   )
@@ -768,10 +933,20 @@ function RequestList({ requests, isSenior = false, onUpdateRequest }) {
               <strong>{request.goal}</strong>
               <span>{request.juniorName} with {request.mentorName} · {request.preferredTime}</span>
             </div>
-            {isSenior && request.status === 'Requested' ? (
+            {isSenior ? (
               <div className="request-actions">
-                <button type="button" onClick={() => onUpdateRequest(request.id, 'Accepted')}>Accept</button>
-                <button type="button" onClick={() => onUpdateRequest(request.id, 'Rejected')}>Reject</button>
+                {request.status === 'Requested' && (
+                  <>
+                    <button type="button" onClick={() => onUpdateRequest(request.id, 'Accepted')}>Accept</button>
+                    <button type="button" onClick={() => onUpdateRequest(request.id, 'Rejected')}>Reject</button>
+                  </>
+                )}
+                {request.status === 'Accepted' && (
+                  <button type="button" onClick={() => onUpdateRequest(request.id, 'Completed')}>Mark Completed</button>
+                )}
+                {request.status !== 'Requested' && request.status !== 'Accepted' && (
+                  <span className={`status ${request.status.toLowerCase()}`}>{request.status}</span>
+                )}
               </div>
             ) : <span className={`status ${request.status.toLowerCase()}`}>{request.status}</span>}
           </article>

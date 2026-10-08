@@ -9,6 +9,7 @@ urlpatterns = [
     path("auth/register/", views.register, name="register"),
     path("auth/login/", views.login, name="login"),
     path("users/<str:user_id>/availability/", views.set_availability, name="set_availability"),
+    path("users/<str:user_id>/profile/", views.update_profile, name="update_profile"),
     path("requests/", views.requests_endpoint, name="requests"),
     path("requests/<str:request_id>/", views.update_request, name="update_request"),
 ]

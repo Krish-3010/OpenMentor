@@ -96,7 +96,7 @@ def register(request):
     required = ["name", "email", "password", "role"]
     if payload is None:
         return JsonResponse({"error": "Invalid JSON body."}, status=400)
-    missing = [field for field in required if not payload.get(field)]
+    missing = [field for field in required if not str(payload.get(field, "")).strip()]
     role = str(payload.get("role", "")).lower()
     if missing or role not in {"junior", "senior"} or len(str(payload.get("password", ""))) < 8:
         return JsonResponse({"error": "Name, email, password, and a valid role are required."}, status=400)
@@ -104,15 +104,32 @@ def register(request):
     database = get_database()
     if database is None:
         return JsonResponse({"error": "Database unavailable."}, status=503)
+
+    user_name = str(payload["name"]).strip()
+    user_email = str(payload["email"]).strip().lower()
+
+    skills_input = payload.get("skills", [])
+    if isinstance(skills_input, str):
+        skills_list = [s.strip() for s in skills_input.split(",") if s.strip()]
+    elif isinstance(skills_input, list):
+        skills_list = [str(s).strip() for s in skills_input if str(s).strip()]
+    else:
+        skills_list = []
+
     user = {
         "id": str(uuid4()),
-        "name": str(payload["name"]).strip(),
-        "email": str(payload["email"]).strip().lower(),
+        "name": user_name,
+        "email": user_email,
         "role": role,
         "available": role == "senior",
         "createdAt": datetime.now(timezone.utc).isoformat(),
         "password": make_password(payload["password"]),
+        "bio": str(payload.get("bio", "")).strip() or (f"Senior mentor specializing in {', '.join(skills_list)}" if skills_list else "Senior mentor ready to guide students."),
+        "skills": skills_list,
+        "mode": str(payload.get("mode", "Online")).strip() or "Online",
+        "availability": str(payload.get("availability", "Available for mentorship")).strip() or "Available for mentorship",
     }
+
     try:
         if database.users.find_one({"email": user["email"]}):
             return JsonResponse({"error": "An account with this email already exists."}, status=409)
@@ -123,12 +140,12 @@ def register(request):
                 "userId": user["id"],
                 "name": user["name"],
                 "role": "Senior mentor",
-                "skills": [],
-                "availability": "Set your next available slot",
-                "rating": 0,
+                "skills": user["skills"],
+                "availability": user["availability"],
+                "rating": payload.get("rating", 5.0),
                 "sessions": 0,
-                "mode": "Online",
-                "bio": "New OpenMentor senior mentor.",
+                "mode": user["mode"],
+                "bio": user["bio"],
                 "available": True,
             })
     except PyMongoError:
@@ -180,12 +197,12 @@ def set_availability(request, user_id):
                 "userId": canonical_user_id,
                 "name": user.get("name", "Senior mentor"),
                 "role": "Senior mentor",
-                "skills": [],
-                "availability": "Set your next available slot",
-                "rating": 0,
+                "skills": user.get("skills", []),
+                "availability": user.get("availability", "Available for mentorship"),
+                "rating": 5.0,
                 "sessions": 0,
-                "mode": "Online",
-                "bio": "OpenMentor senior mentor.",
+                "mode": user.get("mode", "Online"),
+                "bio": user.get("bio", "Senior mentor ready to guide students."),
                 "available": payload["available"],
             })
         if user_result.matched_count == 0:
@@ -195,13 +212,78 @@ def set_availability(request, user_id):
         return JsonResponse({"error": "Could not update availability."}, status=503)
 
 
+@csrf_exempt
+@require_http_methods(["PATCH"])
+def update_profile(request, user_id):
+    payload = json_body(request)
+    if payload is None:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+    database = get_database()
+    if database is None:
+        return JsonResponse({"error": "Database unavailable."}, status=503)
+
+    try:
+        user = database.users.find_one(user_selector(user_id))
+        if not user:
+            return JsonResponse({"error": "User account not found."}, status=404)
+
+        user_updates = {}
+        mentor_updates = {}
+
+        if "name" in payload and str(payload["name"]).strip():
+            new_name = str(payload["name"]).strip()
+            user_updates["name"] = new_name
+            mentor_updates["name"] = new_name
+
+        if "bio" in payload:
+            new_bio = str(payload["bio"]).strip()
+            user_updates["bio"] = new_bio
+            mentor_updates["bio"] = new_bio
+
+        if "skills" in payload:
+            raw_skills = payload["skills"]
+            if isinstance(raw_skills, list):
+                skills_list = [str(s).strip() for s in raw_skills if str(s).strip()]
+            elif isinstance(raw_skills, str):
+                skills_list = [s.strip() for s in raw_skills.split(",") if s.strip()]
+            else:
+                skills_list = []
+            user_updates["skills"] = skills_list
+            mentor_updates["skills"] = skills_list
+
+        if "mode" in payload and str(payload["mode"]).strip():
+            new_mode = str(payload["mode"]).strip()
+            user_updates["mode"] = new_mode
+            mentor_updates["mode"] = new_mode
+
+        if "availability" in payload and str(payload["availability"]).strip():
+            new_avail = str(payload["availability"]).strip()
+            user_updates["availability"] = new_avail
+            mentor_updates["availability"] = new_avail
+
+        if user_updates:
+            database.users.update_one({"_id": user["_id"]}, {"$set": user_updates})
+
+        canonical_user_id = public_id(user)
+        if str(user.get("role", "")).lower() in {"senior", "senior mentor"} and mentor_updates:
+            mentor_selector = {"$or": [{"userId": canonical_user_id}, {"userId": user["_id"]}]}
+            database.mentors.update_one(mentor_selector, {"$set": mentor_updates})
+
+        updated_user = database.users.find_one({"_id": user["_id"]})
+        return JsonResponse({"user": public_user(normalize_document(updated_user))})
+    except PyMongoError:
+        return JsonResponse({"error": "Could not update profile."}, status=503)
+
+
 @require_GET
 def list_requests(request):
     database = get_database()
     if database is None:
-        return JsonResponse({"requests": []})
+        return JsonResponse({"error": "Database unavailable."}, status=503)
     user_id = request.GET.get("userId")
     role = request.GET.get("role")
+    if not user_id or not role:
+        return JsonResponse({"error": "userId and a valid role are required."}, status=400)
     try:
         if role == "junior":
             query = {"juniorId": user_id}
@@ -228,16 +310,10 @@ def create_request(request):
     required = ["juniorId", "juniorName", "email", "goal", "preferredTime", "mentorId", "mentorName"]
     if payload is None:
         return JsonResponse({"error": "Invalid JSON body."}, status=400)
-    missing = [field for field in required if not payload.get(field)]
+    missing = [field for field in required if not str(payload.get(field, "")).strip()]
     if missing:
         return JsonResponse({"error": "Missing required fields.", "fields": missing}, status=400)
 
-    request_doc = {
-        "id": str(uuid4()),
-        **{field: payload[field] for field in required},
-        "status": "Requested",
-        "createdAt": datetime.now(timezone.utc).isoformat(),
-    }
     database = get_database()
     if database is None:
         return JsonResponse({"error": "Database unavailable."}, status=503)
@@ -252,6 +328,20 @@ def create_request(request):
         )
         if not mentor:
             return JsonResponse({"error": "This mentor is not currently available."}, status=409)
+
+        request_doc = {
+            "id": str(uuid4()),
+            "juniorId": str(payload["juniorId"]).strip(),
+            "juniorName": junior.get("name", str(payload["juniorName"]).strip()),
+            "email": junior.get("email", str(payload["email"]).strip().lower()),
+            "goal": str(payload["goal"]).strip(),
+            "preferredTime": str(payload["preferredTime"]).strip(),
+            "mentorId": public_id(mentor),
+            "mentorName": mentor.get("name", str(payload["mentorName"]).strip()),
+            "status": "Requested",
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+        }
+
         database.requests.insert_one(request_doc)
         return JsonResponse({"request": normalize_document(request_doc)}, status=201)
     except PyMongoError:
@@ -279,18 +369,23 @@ def update_request(request, request_id):
         return JsonResponse({"error": "Database unavailable."}, status=503)
     try:
         request_doc = database.requests.find_one({"id": request_id})
-        mentor = (
-            database.mentors.find_one(document_selector(request_doc.get("mentorId")))
-            if request_doc
-            else None
-        )
+        if not request_doc:
+            return JsonResponse({"error": "Request not found."}, status=404)
+
+        mentor = database.mentors.find_one(document_selector(request_doc.get("mentorId")))
         mentor_user_id = mentor.get("userId") if mentor else None
         mentor_matches_senior = mentor_user_id in {senior_id, _object_id_or_value(senior_id)}
-        if not request_doc or not mentor or not mentor_matches_senior:
+        if not mentor or not mentor_matches_senior:
             return JsonResponse({"error": "You can only update requests sent to you."}, status=403)
+
+        previous_status = request_doc.get("status")
         result = database.requests.update_one({"id": request_id}, {"$set": {"status": status}})
         if result.matched_count == 0:
             return JsonResponse({"error": "Request not found."}, status=404)
+
+        if status == "Completed" and previous_status != "Completed":
+            database.mentors.update_one({"_id": mentor["_id"]}, {"$inc": {"sessions": 1}})
+
         return JsonResponse({"status": status})
     except PyMongoError:
         return JsonResponse({"error": "Could not update the request."}, status=503)
